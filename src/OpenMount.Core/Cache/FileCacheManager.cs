@@ -26,10 +26,13 @@ namespace OpenMount.Core.Cache
         private readonly long _maxCacheBytes;
         private readonly ConcurrentDictionary<string, CacheEntry> _entries =
             new ConcurrentDictionary<string, CacheEntry>(StringComparer.OrdinalIgnoreCase);
+        private int _isTrimming;
+        private long _lastTrimTicksUtc;
 
         // Files up to 64 MB are downloaded completely to local disk on first read.
         // Larger files stream on-demand using HTTP Range requests without blocking.
         public const long FullCacheSizeThreshold = 64 * 1024 * 1024;
+        private const int StreamCopyBufferSize = 262144; // 256 KB
 
         public string CacheDirectory => _cacheDir;
 
@@ -63,8 +66,12 @@ namespace OpenMount.Core.Cache
         public string GetLocalPathForVirtual(string virtualPath)
         {
             string norm = NormalizeVirtualPath(virtualPath);
-            using var sha = SHA256.Create();
-            byte[] hashBytes = sha.ComputeHash(Encoding.UTF8.GetBytes(norm.ToLowerInvariant()));
+            if (_entries.TryGetValue(norm, out var existingEntry) && !string.IsNullOrEmpty(existingEntry.LocalFilePath))
+            {
+                return existingEntry.LocalFilePath;
+            }
+
+            byte[] hashBytes = SHA256.HashData(Encoding.UTF8.GetBytes(norm.ToLowerInvariant()));
             string hash = Convert.ToHexString(hashBytes).ToLowerInvariant();
 
             string ext = Path.GetExtension(virtualPath);
@@ -103,6 +110,50 @@ namespace OpenMount.Core.Cache
         }
 
         /// <summary>
+        /// Fast check if a file (of any size, including > 64 MB) already exists locally in staging or cache.
+        /// Avoids redundant network HTTP Range requests right after writing/uploading large files.
+        /// </summary>
+        public bool TryGetCachedOrStagedFilePath(string virtualPath, long expectedSize, out string? localPath)
+        {
+            string norm = NormalizeVirtualPath(virtualPath);
+            if (_entries.TryGetValue(norm, out var entry))
+            {
+                lock (entry.SyncRoot)
+                {
+                    if ((entry.IsDirty || entry.IsFullyCached) && File.Exists(entry.LocalFilePath))
+                    {
+                        entry.LastAccessTimeUtc = DateTime.UtcNow;
+                        localPath = entry.LocalFilePath;
+                        return true;
+                    }
+                }
+            }
+
+            localPath = null;
+            return false;
+        }
+
+        /// <summary>
+        /// Marks a staged file as clean and fully cached after upload completes, keeping it available for instant local reads.
+        /// </summary>
+        public void MarkUploadCompleted(string virtualPath, long finalSize, DateTimeOffset lastModifiedUtc)
+        {
+            string norm = NormalizeVirtualPath(virtualPath);
+            if (_entries.TryGetValue(norm, out var entry))
+            {
+                lock (entry.SyncRoot)
+                {
+                    entry.IsDirty = false;
+                    entry.IsFullyCached = File.Exists(entry.LocalFilePath);
+                    entry.RemoteSize = finalSize;
+                    entry.RemoteModifiedUtc = lastModifiedUtc;
+                    entry.LastAccessTimeUtc = DateTime.UtcNow;
+                }
+                ScheduleTrimCacheIfNeeded();
+            }
+        }
+
+        /// <summary>
         /// Ensures a full copy of the file exists in local cache, downloading it from remote if necessary.
         /// </summary>
         public async Task<string> EnsureFileCachedAsync(
@@ -117,7 +168,7 @@ namespace OpenMount.Core.Cache
 
             lock (entry.SyncRoot)
             {
-                if (entry.IsFullyCached && File.Exists(entry.LocalFilePath))
+                if ((entry.IsFullyCached || entry.IsDirty) && File.Exists(entry.LocalFilePath))
                 {
                     return entry.LocalFilePath;
                 }
@@ -127,9 +178,9 @@ namespace OpenMount.Core.Cache
             try
             {
                 using (var remoteStream = await openRemoteStream(0, null, ct).ConfigureAwait(false))
-                using (var localFile = new FileStream(tempDownloading, FileMode.Create, FileAccess.Write, FileShare.None, 65536, useAsync: true))
+                using (var localFile = new FileStream(tempDownloading, FileMode.Create, FileAccess.Write, FileShare.None, StreamCopyBufferSize, useAsync: true))
                 {
-                    await remoteStream.CopyToAsync(localFile, 65536, ct).ConfigureAwait(false);
+                    await remoteStream.CopyToAsync(localFile, StreamCopyBufferSize, ct).ConfigureAwait(false);
                     await localFile.FlushAsync(ct).ConfigureAwait(false);
                 }
 
@@ -145,7 +196,7 @@ namespace OpenMount.Core.Cache
                     entry.RemoteModifiedUtc = remoteModified;
                 }
 
-                _ = Task.Run(() => TrimCacheIfNeeded());
+                ScheduleTrimCacheIfNeeded();
                 return entry.LocalFilePath;
             }
             catch
@@ -182,13 +233,18 @@ namespace OpenMount.Core.Cache
 
             if (existingRemoteSize > 0 && openRemoteStream != null)
             {
-                return await EnsureFileCachedAsync(virtualPath, existingRemoteSize, remoteModified, openRemoteStream, ct).ConfigureAwait(false);
+                string cachedPath = await EnsureFileCachedAsync(virtualPath, existingRemoteSize, remoteModified, openRemoteStream, ct).ConfigureAwait(false);
+                lock (entry.SyncRoot)
+                {
+                    entry.IsDirty = true;
+                }
+                return cachedPath;
             }
 
             // Fresh empty staging file
             lock (entry.SyncRoot)
             {
-                using var fs = new FileStream(entry.LocalFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete);
+                using var fs = new FileStream(entry.LocalFilePath, FileMode.Create, FileAccess.ReadWrite, FileShare.ReadWrite | FileShare.Delete, 4096);
                 entry.IsFullyCached = true;
                 entry.IsDirty = true;
                 entry.RemoteSize = 0;
@@ -217,6 +273,34 @@ namespace OpenMount.Core.Cache
             _entries.Clear();
         }
 
+        private void ScheduleTrimCacheIfNeeded()
+        {
+            long nowTicks = DateTime.UtcNow.Ticks;
+            long lastTicks = Interlocked.Read(ref _lastTrimTicksUtc);
+            if (nowTicks - lastTicks < TimeSpan.FromSeconds(30).Ticks)
+            {
+                return;
+            }
+
+            if (Interlocked.CompareExchange(ref _isTrimming, 1, 0) != 0)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref _lastTrimTicksUtc, nowTicks);
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    TrimCacheIfNeeded();
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref _isTrimming, 0);
+                }
+            });
+        }
+
         private void TrimCacheIfNeeded()
         {
             try
@@ -233,6 +317,15 @@ namespace OpenMount.Core.Cache
 
                 if (totalBytes <= _maxCacheBytes) return;
 
+                var dirtyPaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var kvp in _entries)
+                {
+                    if (kvp.Value.IsDirty && !string.IsNullOrEmpty(kvp.Value.LocalFilePath))
+                    {
+                        dirtyPaths.Add(kvp.Value.LocalFilePath);
+                    }
+                }
+
                 // Sort by LastAccessTime ascending (oldest first)
                 Array.Sort(files, (a, b) => a.LastAccessTimeUtc.CompareTo(b.LastAccessTimeUtc));
 
@@ -243,6 +336,7 @@ namespace OpenMount.Core.Cache
 
                     // Do not delete files currently marked dirty or downloading
                     if (f.Extension.StartsWith(".dl_") || f.Extension == ".tmp") continue;
+                    if (dirtyPaths.Contains(f.FullName)) continue;
 
                     long len = f.Length;
                     try

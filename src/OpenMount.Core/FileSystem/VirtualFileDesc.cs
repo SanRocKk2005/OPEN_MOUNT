@@ -1,4 +1,5 @@
 using System;
+using System.Buffers;
 using System.IO;
 
 namespace OpenMount.Core.FileSystem
@@ -15,6 +16,13 @@ namespace OpenMount.Core.FileSystem
         }
         public bool IsModified { get; set; }
         public uint GrantedAccess { get; }
+        public bool HasRecordedRead { get; set; }
+        public bool HasRecordedWrite { get; set; }
+
+        // Read-ahead range chunk cache for large remote files (> 64 MB) to avoid per-64KB HTTP requests
+        public byte[]? RangeChunkBuffer { get; set; }
+        public long RangeChunkOffset { get; set; } = -1;
+        public int RangeChunkLength { get; set; }
 
         public static string UnsavedRecoveryDir { get; set; } =
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "OpenMount", "unsaved");
@@ -31,6 +39,18 @@ namespace OpenMount.Core.FileSystem
         {
             if (LocalFileStream != null) return LocalFileStream;
             throw new InvalidOperationException("No active stream on file descriptor.");
+        }
+
+        public void ReleaseRangeBuffer()
+        {
+            var buf = RangeChunkBuffer;
+            if (buf != null)
+            {
+                RangeChunkBuffer = null;
+                RangeChunkOffset = -1;
+                RangeChunkLength = 0;
+                ArrayPool<byte>.Shared.Return(buf);
+            }
         }
 
         public void PreserveUnsavedChanges()
@@ -54,6 +74,8 @@ namespace OpenMount.Core.FileSystem
 
         public void Dispose()
         {
+            ReleaseRangeBuffer();
+
             try
             {
                 LocalFileStream?.Dispose();

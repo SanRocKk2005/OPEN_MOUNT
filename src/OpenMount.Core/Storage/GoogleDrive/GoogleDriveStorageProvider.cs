@@ -446,8 +446,11 @@ namespace OpenMount.Core.Storage.GoogleDrive
                 throw new DirectoryNotFoundException($"Parent directory not found for {path}");
             }
 
+            long streamLength = contentStream.CanSeek ? contentStream.Length : -1;
+
             // Check if file already exists in parent
             var existing = await ResolveItemByPathAsync(clean, ct).ConfigureAwait(false);
+            File? uploadedFile = null;
 
             if (existing != null && !existing.IsDirectory)
             {
@@ -458,8 +461,9 @@ namespace OpenMount.Core.Storage.GoogleDrive
                     contentStream,
                     "application/octet-stream");
                 updateReq.SupportsAllDrives = true;
+                updateReq.Fields = "id, name, mimeType, size, modifiedTime, createdTime";
 
-                await ExecuteResumableUploadAsync(updateReq, clean, ct).ConfigureAwait(false);
+                uploadedFile = await ExecuteResumableUploadAsync(updateReq, clean, streamLength, ct).ConfigureAwait(false);
             }
             else
             {
@@ -475,19 +479,92 @@ namespace OpenMount.Core.Storage.GoogleDrive
                     contentStream,
                     "application/octet-stream");
                 createReq.SupportsAllDrives = true;
+                createReq.Fields = "id, name, mimeType, size, modifiedTime, createdTime";
 
-                await ExecuteResumableUploadAsync(createReq, clean, ct).ConfigureAwait(false);
+                uploadedFile = await ExecuteResumableUploadAsync(createReq, clean, streamLength, ct).ConfigureAwait(false);
             }
 
-            InvalidateCache(parent.Id, clean);
+            if (uploadedFile != null && !string.IsNullOrEmpty(uploadedFile.Id))
+            {
+                UpdateCacheWithUploadedItem(parent.Id, clean, fileName, uploadedFile, streamLength);
+            }
+            else
+            {
+                InvalidateCache(parent.Id, clean);
+            }
         }
 
-        private async Task ExecuteResumableUploadAsync<TRequest>(
+        private void UpdateCacheWithUploadedItem(string parentFolderId, string virtualPath, string fileName, File uploadedFile, long fallbackSize)
+        {
+            long finalSize = uploadedFile.Size ?? (fallbackSize >= 0 ? fallbackSize : 0);
+            var now = DateTimeOffset.UtcNow;
+            var newItem = new GoogleDriveItem
+            {
+                Id = uploadedFile.Id,
+                Name = fileName,
+                OriginalName = uploadedFile.Name ?? fileName,
+                ParentId = parentFolderId,
+                VirtualPath = virtualPath,
+                IsDirectory = false,
+                IsWorkspaceDoc = false,
+                Size = finalSize,
+                CreatedTime = uploadedFile.CreatedTimeDateTimeOffset ?? now,
+                ModifiedTime = uploadedFile.ModifiedTimeDateTimeOffset ?? now,
+                MimeType = uploadedFile.MimeType ?? "application/octet-stream"
+            };
+
+            _pathCache[virtualPath] = newItem;
+            _negativeCache.TryRemove(virtualPath, out _);
+
+            if (_dirCache.TryGetValue(parentFolderId, out var cachedDir))
+            {
+                var updatedList = new List<GoogleDriveItem>(cachedDir.Items.Count + 1);
+                bool replaced = false;
+                foreach (var it in cachedDir.Items)
+                {
+                    if (string.Equals(it.VirtualPath, virtualPath, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(it.Id, newItem.Id, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!replaced)
+                        {
+                            updatedList.Add(newItem);
+                            replaced = true;
+                        }
+                    }
+                    else
+                    {
+                        updatedList.Add(it);
+                    }
+                }
+
+                if (!replaced)
+                {
+                    updatedList.Add(newItem);
+                }
+
+                _dirCache[parentFolderId] = (DateTime.UtcNow, updatedList);
+            }
+        }
+
+        private async Task<File?> ExecuteResumableUploadAsync<TRequest>(
             Google.Apis.Upload.ResumableUpload<TRequest, File> uploader,
             string virtualPath,
+            long streamLength,
             CancellationToken ct)
         {
-            uploader.ChunkSize = Google.Apis.Upload.ResumableUpload.MinimumChunkSize * 4; // 1 MB chunking
+            // Scale chunk size dynamically to minimize HTTP PUT round-trips on large uploads (e.g. 1 GB+)
+            if (streamLength > 64L * 1024 * 1024)
+            {
+                uploader.ChunkSize = Google.Apis.Upload.ResumableUpload.MinimumChunkSize * 40; // 10 MB chunking
+            }
+            else if (streamLength > 4L * 1024 * 1024)
+            {
+                uploader.ChunkSize = Google.Apis.Upload.ResumableUpload.MinimumChunkSize * 16; // 4 MB chunking
+            }
+            else
+            {
+                uploader.ChunkSize = Google.Apis.Upload.ResumableUpload.MinimumChunkSize * 4;  // 1 MB chunking
+            }
 
             int maxRetries = 3;
             int retryCount = 0;
@@ -514,6 +591,8 @@ namespace OpenMount.Core.Storage.GoogleDrive
                     $"Google Drive resumable upload failed for '{virtualPath}' after {retryCount} retries: {progress.Exception?.Message}",
                     progress.Exception);
             }
+
+            return uploader.ResponseBody;
         }
 
         private static bool IsTransientUploadError(Exception? ex)

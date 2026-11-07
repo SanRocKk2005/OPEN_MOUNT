@@ -243,6 +243,85 @@ namespace OpenMount.Tests
                 Marshal.FreeHGlobal(buffer);
                 vfs.Close(fileNode, fileDesc);
             }
+
+            // Subsequent Open + Read right after upload should hit retained local cache & in-memory metadata without remote calls
+            int reopenStatus = vfs.Open(
+                "\\new_file.txt",
+                0,
+                0x80000000,
+                out object readNode,
+                out object readDesc,
+                out _,
+                out _);
+            Assert.Equal(0, reopenStatus);
+
+            IntPtr readBuf = Marshal.AllocHGlobal(bytesToWrite.Length);
+            try
+            {
+                int rStatus = vfs.Read(readNode, readDesc, readBuf, 0, (uint)bytesToWrite.Length, out uint readCount);
+                Assert.Equal(0, rStatus);
+                Assert.Equal((uint)bytesToWrite.Length, readCount);
+                mockStorage.Verify(s => s.OpenReadAsync(It.IsAny<string>(), It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<CancellationToken>()), Times.Never);
+                mockStorage.Verify(s => s.GetMetadataAsync("\\new_file.txt", It.IsAny<CancellationToken>()), Times.Never);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(readBuf);
+                vfs.Close(readNode, readDesc);
+            }
+        }
+
+        [Fact]
+        public void VirtualFileSystem_LargeFileRead_CoalescesSequential64KBReadsViaReadAheadBuffer()
+        {
+            long largeFileSize = 100L * 1024 * 1024; // 100 MB (> 64 MB threshold)
+            int openReadCalls = 0;
+
+            var mockStorage = new Mock<IStorageProvider>();
+            mockStorage.Setup(s => s.ProviderId).Returns("mock");
+            mockStorage.Setup(s => s.GetMetadataAsync("\\movie.mp4", It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new StorageItemMetadata
+                {
+                    Path = "\\movie.mp4",
+                    Name = "movie.mp4",
+                    Size = largeFileSize,
+                    IsDirectory = false
+                });
+
+            mockStorage.Setup(s => s.OpenReadAsync("\\movie.mp4", It.IsAny<long>(), It.IsAny<long?>(), It.IsAny<CancellationToken>()))
+                .Returns<string, long, long?, CancellationToken>((p, off, len, ct) =>
+                {
+                    Interlocked.Increment(ref openReadCalls);
+                    int size = (int)(len ?? (4 * 1024 * 1024));
+                    byte[] chunk = new byte[size];
+                    Array.Fill(chunk, (byte)0x5A);
+                    return Task.FromResult<Stream>(new MemoryStream(chunk));
+                });
+
+            var cacheManager = new FileCacheManager("mock-drive", _testCacheDir);
+            var vfs = new VirtualFileSystem(mockStorage.Object, null, cacheManager);
+
+            Assert.Equal(0, vfs.Open("\\movie.mp4", 0, 0x80000000, out object node, out object desc, out _, out _));
+
+            IntPtr buf = Marshal.AllocHGlobal(65536);
+            try
+            {
+                // Perform 16 sequential 64 KB reads (1 MB total)
+                for (int i = 0; i < 16; i++)
+                {
+                    int st = vfs.Read(node, desc, buf, (ulong)(i * 65536), 65536, out uint read);
+                    Assert.Equal(0, st);
+                    Assert.Equal(65536u, read);
+                }
+
+                // Should only have made 1 HTTP Range request (4 MB read-ahead window) instead of 16
+                Assert.Equal(1, openReadCalls);
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(buf);
+                vfs.Close(node, desc);
+            }
         }
 
         /// <summary>

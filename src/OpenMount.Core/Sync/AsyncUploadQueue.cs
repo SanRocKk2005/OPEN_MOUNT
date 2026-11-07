@@ -21,6 +21,7 @@ namespace OpenMount.Core.Sync
     {
         private readonly IStorageProvider _storage;
         private readonly Action<string>? _onUploadCompleted;
+        private readonly bool _keepLocalFileAfterUpload;
         private readonly Channel<UploadTask> _channel;
         private readonly ConcurrentDictionary<string, UploadTask> _inFlight =
             new ConcurrentDictionary<string, UploadTask>(StringComparer.OrdinalIgnoreCase);
@@ -31,10 +32,15 @@ namespace OpenMount.Core.Sync
         public int QueueCount => _channel.Reader.Count;
         public int ActiveUploadCount => _activeUploadCount;
 
-        public AsyncUploadQueue(IStorageProvider storage, Action<string>? onUploadCompleted = null, int maxConcurrentWorkers = 2)
+        public AsyncUploadQueue(
+            IStorageProvider storage,
+            Action<string>? onUploadCompleted = null,
+            int maxConcurrentWorkers = 2,
+            bool keepLocalFileAfterUpload = false)
         {
             _storage = storage ?? throw new ArgumentNullException(nameof(storage));
             _onUploadCompleted = onUploadCompleted;
+            _keepLocalFileAfterUpload = keepLocalFileAfterUpload;
 
             _channel = Channel.CreateUnbounded<UploadTask>(new UnboundedChannelOptions
             {
@@ -113,13 +119,22 @@ namespace OpenMount.Core.Sync
             {
                 try
                 {
-                    using (var fs = new FileStream(task.LocalFilePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    using (var fs = new FileStream(
+                        task.LocalFilePath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete,
+                        262144,
+                        FileOptions.SequentialScan | FileOptions.Asynchronous))
                     {
                         await _storage.CreateFileAsync(task.VirtualPath, fs, ct).ConfigureAwait(false);
                     }
 
                     _onUploadCompleted?.Invoke(task.VirtualPath);
-                    try { File.Delete(task.LocalFilePath); } catch { }
+                    if (!_keepLocalFileAfterUpload)
+                    {
+                        try { File.Delete(task.LocalFilePath); } catch { }
+                    }
                     return;
                 }
                 catch (Exception) when (task.RetryCount < maxRetries && !ct.IsCancellationRequested)
